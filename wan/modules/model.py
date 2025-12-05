@@ -70,6 +70,47 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).float()
 
 
+def _pack_by_mask(tensor, mask, seq_lens):
+    if mask is None:
+        return tensor, None, None, False
+
+    mask = mask.bool()
+    device = tensor.device
+    batch, max_len = tensor.shape[:2]
+    head_dim = tensor.size(3)
+    num_heads = tensor.size(2)
+    lengths = []
+    indices = []
+    max_active = 0
+    for i in range(batch):
+        valid_len = int(seq_lens[i].item())
+        idx = torch.nonzero(mask[i, :valid_len], as_tuple=False).flatten()
+        indices.append(idx)
+        active = idx.numel()
+        lengths.append(active)
+        if active > max_active:
+            max_active = active
+
+    lengths_tensor = torch.tensor(lengths, device=device, dtype=torch.int32)
+    if max_active == 0:
+        return None, lengths_tensor, indices, True
+
+    packed = tensor.new_zeros((batch, max_active, num_heads, head_dim))
+    for i, idx in enumerate(indices):
+        if idx.numel() > 0:
+            packed[i, :idx.numel()] = tensor[i, idx]
+    return packed, lengths_tensor, indices, False
+
+
+def _scatter_by_mask(src, indices, target):
+    if src is None or indices is None:
+        return target
+    for i, idx in enumerate(indices):
+        if idx is not None and idx.numel() > 0:
+            target[i, idx] = src[i, :idx.numel()]
+    return target
+
+
 class WanRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-5):
@@ -127,7 +168,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, query_mask=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -146,22 +187,50 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        rope_q = rope_apply(q, grid_sizes, freqs)
+        rope_k = rope_apply(k, grid_sizes, freqs)
+
+        if query_mask is not None:
+            packed_q, q_lengths, indices, all_empty = _pack_by_mask(
+                rope_q, query_mask, seq_lens)
+            if all_empty:
+                attn_out = rope_q.new_zeros((b, s, n, d))
+            else:
+                attn_fg = flash_attention(
+                    q=packed_q,
+                    k=rope_k,
+                    v=v,
+                    q_lens=q_lengths,
+                    k_lens=seq_lens.to(dtype=torch.int32, device=rope_q.device),
+                    window_size=self.window_size)
+                attn_out = rope_q.new_zeros((b, s, n, d))
+                attn_out = _scatter_by_mask(attn_fg, indices, attn_out)
+        else:
+            attn_out = flash_attention(
+                q=rope_q,
+                k=rope_k,
+                v=v,
+                k_lens=seq_lens.to(dtype=torch.int32, device=rope_q.device),
+                window_size=self.window_size)
 
         # output
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
+        attn_out = attn_out.flatten(2)
+        attn_out = self.o(attn_out)
+        if query_mask is not None:
+            attn_out = attn_out * query_mask.unsqueeze(-1).to(attn_out.dtype)
+        return attn_out
 
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens):
+    def forward(self,
+                x,
+                context,
+                context_lens,
+                seq_lens,
+                query_mask=None,
+                block_index=None,
+                attn_runtime=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -175,13 +244,49 @@ class WanT2VCrossAttention(WanSelfAttention):
         k = self.norm_k(self.k(context)).view(b, -1, n, d)
         v = self.v(context).view(b, -1, n, d)
 
-        # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        if query_mask is not None:
+            packed_q, q_lengths, indices, all_empty = _pack_by_mask(
+                q, query_mask, seq_lens)
+            if all_empty:
+                attn = q.new_zeros(q.shape)
+            else:
+                k_lens = None if context_lens is None else context_lens.to(
+                    dtype=torch.int32, device=q.device)
+                attn_fg = flash_attention(
+                    q=packed_q,
+                    k=k,
+                    v=v,
+                    q_lens=q_lengths,
+                    k_lens=k_lens)
+                attn = q.new_zeros(q.shape)
+                attn = _scatter_by_mask(attn_fg, indices, attn)
+                if attn_runtime is not None:
+                    attn_runtime.capture(
+                        block_index=block_index,
+                        q=packed_q,
+                        k=k,
+                        lengths=q_lengths,
+                        indices=indices,
+                        head_dim=self.head_dim)
+        else:
+            k_lens = None if context_lens is None else context_lens.to(
+                dtype=torch.int32, device=q.device)
+            attn = flash_attention(q, k, v, k_lens=k_lens)
+            if attn_runtime is not None:
+                attn_runtime.capture(
+                    block_index=block_index,
+                    q=q,
+                    k=k,
+                    lengths=seq_lens,
+                    indices=None,
+                    head_dim=self.head_dim)
 
         # output
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
+        attn = attn.flatten(2)
+        attn = self.o(attn)
+        if query_mask is not None:
+            attn = attn * query_mask.unsqueeze(-1).to(attn.dtype)
+        return attn
 
 
 class WanI2VCrossAttention(WanSelfAttention):
@@ -199,7 +304,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         # self.alpha = nn.Parameter(torch.zeros((1, )))
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, seq_lens, query_mask=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -217,16 +322,45 @@ class WanI2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
-        img_x = flash_attention(q, k_img, v_img, k_lens=None)
-        # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        if query_mask is not None:
+            packed_q, q_lengths, indices, all_empty = _pack_by_mask(
+                q, query_mask, seq_lens)
+            if all_empty:
+                attn = q.new_zeros(q.shape)
+                img_attn = q.new_zeros(q.shape)
+            else:
+                k_lens = None if context_lens is None else context_lens.to(
+                    dtype=torch.int32, device=q.device)
+                attn_fg = flash_attention(
+                    q=packed_q,
+                    k=k,
+                    v=v,
+                    q_lens=q_lengths,
+                    k_lens=k_lens)
+                img_fg = flash_attention(
+                    q=packed_q,
+                    k=k_img,
+                    v=v_img,
+                    q_lens=q_lengths,
+                    k_lens=None)
+                attn = q.new_zeros(q.shape)
+                img_attn = q.new_zeros(q.shape)
+                attn = _scatter_by_mask(attn_fg, indices, attn)
+                img_attn = _scatter_by_mask(img_fg, indices, img_attn)
+        else:
+            k_lens = None if context_lens is None else context_lens.to(
+                dtype=torch.int32, device=q.device)
+            img_attn = flash_attention(q, k_img, v_img, k_lens=None)
+            attn = flash_attention(q, k, v, k_lens=k_lens)
 
         # output
-        x = x.flatten(2)
-        img_x = img_x.flatten(2)
-        x = x + img_x
-        x = self.o(x)
-        return x
+        attn = attn.flatten(2)
+        img_attn = img_attn.flatten(2)
+        attn = attn + img_attn
+        attn = self.o(attn)
+        if query_mask is not None:
+            attn = attn * query_mask.unsqueeze(-1).to(attn.dtype)
+        return attn
 
 
 WAN_CROSSATTENTION_CLASSES = {
@@ -284,6 +418,12 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        fg_mask=None,
+        bg_mask=None,
+        cache_writer=None,
+        cache_reader=None,
+        block_index=None,
+        attn_runtime=None,
     ):
         r"""
         Args:
@@ -293,27 +433,58 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
+        if (cache_writer is not None or cache_reader is not None) and block_index is None:
+            raise ValueError("block_index must be provided when using cache callbacks.")
         assert e.dtype == torch.float32
         with amp.autocast(dtype=torch.float32):
             e = (self.modulation + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
+        mask_fg_unsq = None
+        if fg_mask is not None:
+            mask_fg_unsq = fg_mask.unsqueeze(-1).to(x.dtype)
+
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
+            freqs, query_mask=fg_mask)
         with amp.autocast(dtype=torch.float32):
-            x = x + y * e[2]
+            update = y * e[2]
+            if mask_fg_unsq is not None:
+                update = update * mask_fg_unsq
+            x = x + update
+
+        cached_bg = None
+        if cache_reader is not None:
+            cached_bg = cache_reader(block_index, x.device, x.dtype)
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+        def cross_attn_ffn(x, context, context_lens, e, cached_bg,
+                           attn_runtime):
+            attn = self.cross_attn(
+                self.norm3(x),
+                context,
+                context_lens,
+                seq_lens,
+                query_mask=fg_mask,
+                block_index=block_index,
+                attn_runtime=attn_runtime)
+            x = x + (attn * mask_fg_unsq if mask_fg_unsq is not None else attn)
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
+            if mask_fg_unsq is not None:
+                y = y * mask_fg_unsq
             with amp.autocast(dtype=torch.float32):
                 x = x + y * e[5]
+            if cached_bg is not None and bg_mask is not None:
+                x = torch.where(bg_mask.unsqueeze(-1), cached_bg, x)
+            elif cached_bg is not None:
+                x = cached_bg
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e)
+        x = cross_attn_ffn(x, context, context_lens, e, cached_bg,
+                           attn_runtime)
+        if cache_writer is not None:
+            cache_writer(block_index, x)
         return x
 
 
@@ -498,6 +669,11 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
+        token_mask_fg=None,
+        cache_writer=None,
+        cache_reader=None,
+        attn_recorder=None,
+        attn_context=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -515,6 +691,17 @@ class WanModel(ModelMixin, ConfigMixin):
                 CLIP image features for image-to-video mode or first-last-frame-to-video mode
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
+            token_mask_fg (List[Tensor], *optional*):
+                Foreground token masks aligned with flattened patch tokens for each sample
+            cache_writer (Callable, *optional*):
+                Callback used during activation recording, signature `(block_idx, tensor)`
+            cache_reader (Callable, *optional*):
+                Callback returning cached background activations during reuse, signature
+                `(block_idx, device, dtype) -> Tensor or None`
+            attn_recorder (AttentionRecorder, *optional*):
+                Optional recorder used to capture cross-attention weights.
+            attn_context (dict, *optional*):
+                Per-call recorder context generated upstream (e.g. per step/branch).
 
         Returns:
             List[Tensor]:
@@ -541,6 +728,30 @@ class WanModel(ModelMixin, ConfigMixin):
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
                       dim=1) for u in x
         ])
+
+        fg_mask = None
+        bg_mask = None
+        if token_mask_fg is not None:
+            masks_fg = []
+            masks_bg = []
+            device = x.device
+            for mask, length in zip(token_mask_fg, seq_lens):
+                if mask is None:
+                    raise ValueError("token_mask_fg entries must be tensors when provided.")
+                mask = mask.to(device=device, dtype=torch.bool)
+                if mask.numel() != int(length.item()):
+                    raise ValueError("Foreground mask length must match token length.")
+                padded = torch.zeros(seq_len, dtype=torch.bool, device=device)
+                padded[:mask.numel()] = mask
+                masks_fg.append(padded)
+                masks_bg.append(~padded)
+            fg_mask = torch.stack(masks_fg)
+            bg_mask = torch.stack(masks_bg)
+
+        attn_runtime = None
+        if attn_recorder is not None and attn_context is not None:
+            attn_runtime = attn_recorder.prepare_runtime(attn_context, seq_lens,
+                                                         grid_sizes, fg_mask)
 
         # time embeddings
         with amp.autocast(dtype=torch.float32):
@@ -569,10 +780,15 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            fg_mask=fg_mask,
+            bg_mask=bg_mask,
+            cache_writer=cache_writer,
+            cache_reader=cache_reader,
+            attn_runtime=attn_runtime)
 
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        for idx, block in enumerate(self.blocks):
+            x = block(x, block_index=idx, **kwargs)
 
         # head
         x = self.head(x, e)

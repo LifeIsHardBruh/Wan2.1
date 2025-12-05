@@ -1,0 +1,5 @@
+mean_abs_diff=0.009671
+max_abs_diff=0.043767
+masked_frac=0.100000
+unmasked_frac=0.900000
+threshold_10pct=0.015150
